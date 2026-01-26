@@ -96,9 +96,6 @@ class JobManager:
             if not job or job.status == JobStatus.CANCELLED:
                 # Remove from active list
                 self.active_job_ids.pop(idx)
-                if job:
-                     # ensure 'stopped' state if it was running?
-                     pass
                 continue
             
             if len(job.items_queue) == 0 and job.active_batches == 0:

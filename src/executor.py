@@ -1,7 +1,7 @@
 import asyncio
 import aiohttp
 import logging
-import time
+import logging
 from typing import List, Dict, Any, Optional
 from .models import AgentConfig, Item
 
@@ -55,8 +55,6 @@ class AgentExecutor:
                 async with session.post(config.request_url, json=payload, timeout=timeout) as response:
                     if response.status == 200:
                         data = await response.json()
-                        # specific parser for the response? 
-                        # Assuming agent returns list of results matching items
                         if isinstance(data, list):
                              return data
                         return data.get("results", [])
