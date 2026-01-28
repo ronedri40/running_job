@@ -1,168 +1,104 @@
 import asyncio
-import logging
-import inspect
-from typing import Dict, List, Optional
-from .models import Job, JobStatus, AgentConfig, Item
-from .executor import AgentExecutor
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Dict, List, Any, Set
 
-logger = logging.getLogger(__name__)
+@dataclass
+class JobContext:
+    job_id: str
+    agent_name: str
+    items: List[Any]
+    params: Dict[str, Any]
+    callbacks: Any
+    batch_size: int
+    url: str
+    timeout: int
+    next_batch_idx: int = 0
+    total_batches: int = 0
+    processed_items: int = 0
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    done_evt: asyncio.Event = field(default_factory=asyncio.Event)
 
-class JobManager:
-    def __init__(self):
-        self.jobs: Dict[str, Job] = {}
-        self.active_job_ids: List[str] = []
-        self.active_batches_per_agent: Dict[str, int] = {}
-        self.executor = AgentExecutor()
-        self.running = False
-        self._dispatcher_task: Optional[asyncio.Task] = None
+class Dispatcher:
+    def _init_(self, agent_configs, http_engine: HttpEngine):
+        self.configs = agent_configs
+        self.http_engine = http_engine
+        self.rotations: Dict[str, deque[JobContext]] = {name: deque() for name in agent_configs}
+        self.semaphores: Dict[str, asyncio.Semaphore] = {
+            name: asyncio.Semaphore(cfg.concurrency) for name, cfg in agent_configs.items()
+        }
+        self.cancel_flags: Set[str] = set()
+        self._manager_tasks = []
 
-    def submit_job(self, 
-                   agent_name: str, 
-                   config: AgentConfig, 
-                   items: List[Item],
-                   on_batch_complete: Optional[callable] = None,
-                   on_job_complete: Optional[callable] = None) -> str:
-        
-        job_id = str(len(self.jobs) + 1) # Simple ID generation
-        job = Job(
-            job_id=job_id, 
-            agent_name=agent_name, 
-            config=config, 
-            items_queue=list(items), # make a copy
-            on_batch_complete=on_batch_complete,
-            on_job_complete=on_job_complete
-        )
-        
-        self.jobs[job_id] = job
-        self.active_job_ids.append(job_id)
-        logger.info(f"Job {job_id} submitted with {len(items)} items.")
-        
-        # Ensure dispatcher is running
-        if not self.running:
-            self.start_dispatcher()
-            
-        return job_id
+    async def start(self):
+        for name in self.configs:
+            self._manager_tasks.append(asyncio.create_task(self._agent_manager(name)))
 
-    def cancel_job(self, job_id: str):
-        job = self.jobs.get(job_id)
-        if job and job.status not in [JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED]:
-            job.status = JobStatus.CANCELLED
-            logger.info(f"Job {job_id} cancelled.")
-            # We don't remove from active_job_ids immediately, let dispatcher handle cleanup
-            if job.on_job_complete:
-                 asyncio.create_task(self._safe_callback(job.on_job_complete, job.job_id, job.to_dict()))
+    async def stop(self):
+        for t in self._manager_tasks: t.cancel()
+        await asyncio.gather(*self._manager_tasks, return_exceptions=True)
 
-    def get_job_status(self, job_id: str) -> Optional[Dict]:
-        job = self.jobs.get(job_id)
-        return job.to_dict() if job else None
+    async def submit(self, ctx: JobContext):
+        self.rotations[ctx.agent_name].append(ctx)
 
-    def start_dispatcher(self):
-        if not self.running:
-            self.running = True
-            self._dispatcher_task = asyncio.create_task(self._dispatcher_loop())
-            logger.info("Dispatcher started.")
+    async def _agent_manager(self, agent_name: str):
+        sem = self.semaphores[agent_name]
+        rotation = self.rotations[agent_name]
+        while True:
+            if not rotation:
+                await asyncio.sleep(0.05) # Backoff
+                continue
 
-    async def stop_dispatcher(self):
-        self.running = False
-        if self._dispatcher_task:
-            await self._dispatcher_task
+            await sem.acquire() # Acquire slot BEFORE starting work
+            ctx = rotation.popleft()
+            asyncio.create_task(self._run_batch_step(ctx, sem, rotation))
 
-    async def _safe_callback(self, callback, *args):
-        if not callback: return
+    async def _run_batch_step(self, ctx: JobContext, sem: asyncio.Semaphore, rotation: deque):
+        batch_idx = -1
         try:
-            if inspect.iscoroutinefunction(callback):
-                await callback(*args)
-            else:
-                callback(*args)
-        except Exception as e:
-            logger.error(f"Error in callback: {e}")
-
-    async def _dispatcher_loop(self):
-        idx = 0
-        while self.running:
-            if not self.active_job_ids:
-                await asyncio.sleep(0.1)
-                continue
-
-            # Round Robin Logic
-            # Get current job from the cycle
-            if idx >= len(self.active_job_ids):
-                idx = 0
-            
-            job_id = self.active_job_ids[idx]
-            job = self.jobs.get(job_id)
-            
-            # --- Cleanup & Status Checks ---
-            if not job or job.status == JobStatus.CANCELLED:
-                # Remove from active list
-                self.active_job_ids.pop(idx)
-                continue
-            
-            if len(job.items_queue) == 0 and job.active_batches == 0:
-                # Job is DONE
-                job.status = JobStatus.COMPLETED
-                logger.info(f"Job {job_id} completed.")
-                if job.on_job_complete:
-                    asyncio.create_task(self._safe_callback(job.on_job_complete, job_id, job.to_dict()))
+            # 1. Check Cancel & Assign Batch Index
+            async with ctx.lock:
+                if ctx.job_id in self.cancel_flags:
+                    if not ctx.done_evt.is_set():
+                        await ctx.callbacks.on_job_canceled(ctx.job_id, ctx.agent_name, ctx.processed_items, "Canceled")
+                        ctx.done_evt.set()
+                    sem.release() # Release if we don't proceed to HTTP
+                    return
                 
-                self.active_job_ids.pop(idx)
-                continue
+                batch_idx = ctx.next_batch_idx
+                ctx.next_batch_idx += 1
+                if ctx.next_batch_idx < ctx.total_batches:
+                    rotation.append(ctx) # Re-queue for next worker to pick up in parallel
 
-            if len(job.items_queue) == 0:
-                # No more items to send, just waiting for batches to finish
-                idx += 1
-                continue
+            # 2. HTTP Call (The Agent Work)
+            start = batch_idx * ctx.batch_size
+            items = ctx.items[start : start + ctx.batch_size]
+            
+            res = await self.http_engine.process_batch(ctx.url, {
+                "job_id": ctx.job_id, "agent_name": ctx.agent_name,
+                "batch_index": batch_idx, "items": items, "params": ctx.params
+            }, ctx.timeout)
 
-            # --- Dispatch Logic ---
-            # Check GLOBAL Agent Concurrency Limit
-            # We assume the current job's config carries the authoritative concurrency limit for this agent
-            agent_concurrency = self.active_batches_per_agent.get(job.agent_name, 0)
-            
-            if agent_concurrency < job.config.concurrency:
-                # We can dispatch a batch
-                batch_size = job.config.batch_size
-                batch = job.items_queue[:batch_size]
-                job.items_queue = job.items_queue[batch_size:] # Remove from queue
-                
-                job.status = JobStatus.RUNNING
-                job.active_batches += 1
-                
-                # Update global agent counter
-                self.active_batches_per_agent[job.agent_name] = agent_concurrency + 1
-                
-                # Launch task
-                asyncio.create_task(self._process_batch_wrapper(job, batch))
-                
-                # After dispatching ONE batch for this job, we yield to the next job (Fairness)
-                idx += 1 
-            else:
-                # This agent is maxed out GLOBALLLY. 
-                # Even if this specific job has few active batches, we cannot send more to this agent.
-                # Skip to next job to see if it uses a DIFFERENT agent or if same agent frees up later.
-                idx += 1 
+            # 3. RELEASE SEMAPHORE IMMEDIATELY after HTTP response
+            # This allows the next batch to start hitting the agent while we update S3
+            sem.release()
 
-            
-            # Yield control to event loop to let other tasks run
-            await asyncio.sleep(0)
-
-    async def _process_batch_wrapper(self, job: Job, batch: List[Item]):
-        try:
-            results = await self.executor.process_batch(job.agent_name, job.config, batch)
-            
-            # Update stats
-            success_count = sum(1 for r in results if r.get("status") != "error")
-            failed_count = len(results) - success_count
-            
-            job.processed_count += success_count
-            job.failed_count += failed_count
-            
-            # Trigger callback
-            if job.on_batch_complete:
-                await self._safe_callback(job.on_batch_complete, job.job_id, results)
+            # 4. State Update (S3 Callbacks)
+            async with ctx.lock:
+                ctx.processed_items += len(items)
+                await ctx.callbacks.on_batch_done(ctx.job_id, ctx.agent_name, batch_idx, len(items), res)
+                
+                if ctx.processed_items >= len(ctx.items) and not ctx.done_evt.is_set():
+                    await ctx.callbacks.on_job_done(ctx.job_id, ctx.agent_name, ctx.processed_items, "Complete")
+                    ctx.done_evt.set()
 
         except Exception as e:
-            logger.error(f"Unexpected error in batch execution for job {job.job_id}: {e}")
-        finally:
-            job.active_batches -= 1
-            if job.agent_name in self.active_batches_per_agent:
-                self.active_batches_per_agent[job.agent_name] -= 1
+            # Handle failure ensuring semaphore is released if not already
+            try:
+                sem.release()
+            except ValueError: pass # Already released
+            
+            async with ctx.lock:
+                if not ctx.done_evt.is_set():
+                    await ctx.callbacks.on_job_failed(ctx.job_id, ctx.agent_name, ctx.processed_items, str(e))
+                    ctx.done_evt.set()
