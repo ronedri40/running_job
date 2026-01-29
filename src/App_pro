@@ -1,0 +1,125 @@
+import httpx
+import json
+import logging
+import aioboto3
+from fastapi import FastAPI, Request, Depends, HTTPException
+from contextlib import asynccontextmanager
+from pydantic import BaseModel
+from typing import List, Any, Optional
+
+from .http_engine import HttpEngine
+from .dispatcher import Dispatcher, AgentConfig
+from .job_runner import JobRunner
+
+# --- Mock S3 Callbacks (Replace with your actual implementation) ---
+class S3JobCallbacks:
+    async def on_batch_done(self, *args): pass
+    async def on_job_done(self, *args): pass
+    async def on_job_failed(self, *args): pass
+    async def on_job_canceled(self, *args): pass
+
+# --- Configuration Loader ---
+async def load_s3_configs(bucket: str, key: str) -> dict[str, AgentConfig]:
+    """Loads config from S3 asynchronously."""
+    session = aioboto3.Session()
+    try:
+        async with session.client("s3") as s3:
+            resp = await s3.get_object(Bucket=bucket, Key=key)
+            async with resp['Body'] as stream:
+                data = await stream.read()
+                raw_conf = json.loads(data)
+                
+        return {
+            name: AgentConfig(name=name, **cfg) 
+            for name, cfg in raw_conf.items()
+        }
+    except Exception as e:
+        logging.error(f"S3 Config Load Failed: {e}")
+        # Return empty or raise error depending on strictness
+        raise RuntimeError("Could not load agent configuration from S3")
+
+# --- Lifespan ---
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 1. Initialize Resources
+    async_client = httpx.AsyncClient()
+    engine = HttpEngine(async_client)
+    
+    # 2. Load Configs
+    # Replace with your actual Bucket/Key
+    # agent_configs = await load_s3_configs("my-bucket", "agents.json")
+    
+    # HARDCODED FALLBACK FOR DEMO RUNNING
+    agent_configs = {
+        "fast-agent": AgentConfig("fast-agent", "http://localhost:8080", 2, 10, 30)
+    }
+
+    # 3. Start Dispatcher
+    dispatcher = Dispatcher(agent_configs, engine)
+    await dispatcher.start()
+    
+    runner = JobRunner(dispatcher)
+    
+    # 4. Inject into State
+    app.state.dispatcher = dispatcher
+    app.state.runner = runner
+    
+    yield
+    
+    # 5. Cleanup
+    await dispatcher.stop()
+    await async_client.aclose()
+
+app = FastAPI(lifespan=lifespan)
+
+# --- Dependencies ---
+def get_runner(request: Request) -> JobRunner:
+    return request.app.state.runner
+
+def get_dispatcher(request: Request) -> Dispatcher:
+    return request.app.state.dispatcher
+
+# --- Routes ---
+class JobRequest(BaseModel):
+    agent_name: str
+    items: List[Any]
+    params: Optional[dict] = {}
+
+@app.post("/jobs/run")
+async def run_job(
+    data: JobRequest, 
+    runner: JobRunner = Depends(get_runner)
+):
+    try:
+        job_id = await runner.submit_job(
+            data.agent_name, 
+            data.items, 
+            data.params, 
+            S3JobCallbacks()
+        )
+        return {"job_id": job_id, "status": "queued"}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/jobs/{job_id}/cancel")
+async def cancel_job(
+    job_id: str, 
+    dispatcher: Dispatcher = Depends(get_dispatcher)
+):
+    dispatcher.mark_for_cancel(job_id)
+    return {"job_id": job_id, "status": "cancel_requested"}
+
+@app.patch("/internal/agents/{agent_name}/concurrency")
+async def update_concurrency(
+    agent_name: str, 
+    concurrency: int, 
+    dispatcher: Dispatcher = Depends(get_dispatcher)
+):
+    if agent_name not in dispatcher.configs:
+        raise HTTPException(404, "Agent not found")
+        
+    # Runtime Concurrency Update
+    dispatcher.semaphores[agent_name] = asyncio.Semaphore(concurrency)
+    dispatcher.configs[agent_name].concurrency = concurrency
+    
+    return {"status": "updated", "concurrency": concurrency}
