@@ -1,0 +1,16 @@
+import httpx
+
+class HttpEngine:
+    """Stateless engine responsible only for raw HTTP communication."""
+    def __init__(self, client: httpx.AsyncClient):
+        self.client = client
+
+    async def process_batch(self, url: str, payload: dict, timeout: int) -> dict:
+        """Sends a batch to the agent and returns the JSON response."""
+        response = await self.client.post(
+            f"{url.rstrip('/')}/run_batch", 
+            json=payload, 
+            timeout=timeout
+        )
+        response.raise_for_status()
+        return response.json()
