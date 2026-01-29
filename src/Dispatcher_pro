@@ -1,0 +1,167 @@
+import asyncio
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Dict, List, Any, Set, Optional
+from .http_engine import HttpEngine
+
+@dataclass
+class AgentConfig:
+    name: str
+    request_url: str
+    concurrency: int
+    batch_size: int
+    timeout_sec: int
+
+@dataclass
+class JobContext:
+    job_id: str
+    agent_name: str
+    items: deque  # O(1) pops
+    params: Dict[str, Any]
+    callbacks: Any
+    batch_size: int
+    url: str
+    timeout: int
+    active_batches: int = 0
+    processed_count: int = 0
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    done_evt: asyncio.Event = field(default_factory=asyncio.Event)
+
+class Dispatcher:
+    def __init__(self, agent_configs: Dict[str, AgentConfig], http_engine: HttpEngine):
+        self.configs = agent_configs
+        self.http_engine = http_engine
+        
+        # Fairness Rotation: A queue of jobs taking turns
+        self.rotations: Dict[str, deque[JobContext]] = {
+            name: deque() for name in agent_configs
+        }
+        # Concurrency Limits: Controls active parallel batches
+        self.semaphores: Dict[str, asyncio.Semaphore] = {
+            name: asyncio.Semaphore(cfg.concurrency) for name, cfg in agent_configs.items()
+        }
+        
+        self.cancel_flags: Set[str] = set()
+        self._managers: List[asyncio.Task] = []
+        self._running = False
+
+    async def start(self):
+        self._running = True
+        for name in self.configs:
+            self._managers.append(asyncio.create_task(self._agent_manager(name)))
+
+    async def stop(self):
+        self._running = False
+        for t in self._managers:
+            t.cancel()
+        await asyncio.gather(*self._managers, return_exceptions=True)
+
+    async def submit(self, ctx: JobContext):
+        # Simply add to the end of the line (Fairness)
+        self.rotations[ctx.agent_name].append(ctx)
+
+    def mark_for_cancel(self, job_id: str):
+        self.cancel_flags.add(job_id)
+
+    async def _agent_manager(self, agent_name: str):
+        """The Scheduler Loop: Matches available Semaphores to Waiting Jobs."""
+        sem = self.semaphores[agent_name]
+        rotation = self.rotations[agent_name]
+
+        while self._running:
+            if not rotation:
+                await asyncio.sleep(0.05) # Prevent CPU spin when idle
+                continue
+
+            # 1. Wait for a "Parking Space" (Agent Capacity)
+            await sem.acquire()
+
+            # 2. Pick the next job fairly
+            ctx = rotation.popleft()
+
+            # 3. Spawn a worker for this specific batch
+            asyncio.create_task(self._run_batch_step(ctx, sem, rotation))
+
+    async def _run_batch_step(self, ctx: JobContext, sem: asyncio.Semaphore, rotation: deque):
+        batch_items = []
+        sem_released = False  # Track explicit release to prevent double-release errors
+
+        try:
+            async with ctx.lock:
+                # --- A. Check Cancellation ---
+                if ctx.job_id in self.cancel_flags:
+                    if not ctx.done_evt.is_set():
+                        await ctx.callbacks.on_job_canceled(
+                            ctx.job_id, ctx.agent_name, ctx.processed_count, "Canceled by User"
+                        )
+                        ctx.done_evt.set()
+                    sem.release()
+                    return
+
+                # --- B. Mutate State (Pop Items) ---
+                for _ in range(ctx.batch_size):
+                    if not ctx.items: break
+                    batch_items.append(ctx.items.popleft())
+
+                if not batch_items:
+                    # Should not happen logic-wise, but safe guard
+                    sem.release()
+                    return
+
+                ctx.active_batches += 1
+
+                # --- C. Re-queue for Fairness ---
+                # If items remain, put job back in line for the next available worker
+                if ctx.items:
+                    rotation.append(ctx)
+
+            # --- D. Execute HTTP (The Heavy Lift) ---
+            try:
+                res = await self.http_engine.process_batch(
+                    ctx.url, 
+                    {
+                        "job_id": ctx.job_id, 
+                        "agent_name": ctx.agent_name,
+                        "items": batch_items, 
+                        "params": ctx.params
+                    }, 
+                    ctx.timeout
+                )
+            finally:
+                # CRITICAL OPTIMIZATION:
+                # Release the agent capacity *immediately* after HTTP finishes.
+                # Do not wait for S3 callbacks.
+                sem.release()
+                sem_released = True
+
+            # --- E. Callbacks & Finalization ---
+            async with ctx.lock:
+                ctx.active_batches -= 1
+                ctx.processed_count += len(batch_items)
+
+                # 1. Batch Done Callback
+                await ctx.callbacks.on_batch_done(
+                    ctx.job_id, ctx.agent_name, 0, len(batch_items), res
+                )
+
+                # 2. Job Complete Check
+                # Done if: No items left AND no other workers are currently running batches
+                if not ctx.items and ctx.active_batches == 0 and not ctx.done_evt.is_set():
+                    await ctx.callbacks.on_job_done(
+                        ctx.job_id, ctx.agent_name, ctx.processed_count, "Success"
+                    )
+                    ctx.done_evt.set()
+                    # Clean up cancel flag to free memory
+                    self.cancel_flags.discard(ctx.job_id)
+
+        except Exception as e:
+            # Emergency cleanup
+            if not sem_released:
+                sem.release()
+            
+            async with ctx.lock:
+                if not ctx.done_evt.is_set():
+                    await ctx.callbacks.on_job_failed(
+                        ctx.job_id, ctx.agent_name, ctx.processed_count, str(e)
+                    )
+                    ctx.done_evt.set()
