@@ -1,8 +1,11 @@
 import asyncio
+import logging
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Dict, List, Any, Set, Optional
+from typing import Dict, List, Any, Set
 from .http_engine import HttpEngine
+
+logger = logging.getLogger(__name__)
 
 @dataclass
 class AgentConfig:
@@ -16,7 +19,7 @@ class AgentConfig:
 class JobContext:
     job_id: str
     agent_name: str
-    items: deque  # O(1) pops
+    items: deque
     params: Dict[str, Any]
     callbacks: Any
     batch_size: int
@@ -31,65 +34,66 @@ class Dispatcher:
     def __init__(self, agent_configs: Dict[str, AgentConfig], http_engine: HttpEngine):
         self.configs = agent_configs
         self.http_engine = http_engine
-        
-        # Fairness Rotation: A queue of jobs taking turns
-        self.rotations: Dict[str, deque[JobContext]] = {
-            name: deque() for name in agent_configs
-        }
-        # Concurrency Limits: Controls active parallel batches
+        self.rotations: Dict[str, deque[JobContext]] = {n: deque() for n in agent_configs}
         self.semaphores: Dict[str, asyncio.Semaphore] = {
-            name: asyncio.Semaphore(cfg.concurrency) for name, cfg in agent_configs.items()
+            n: asyncio.Semaphore(c.concurrency) for n, c in agent_configs.items()
         }
-        
         self.cancel_flags: Set[str] = set()
         self._managers: List[asyncio.Task] = []
         self._running = False
 
     async def start(self):
+        logger.info("Starting Dispatcher...")
         self._running = True
         for name in self.configs:
             self._managers.append(asyncio.create_task(self._agent_manager(name)))
+            logger.info(f"Started manager for agent: {name} (Concurrency: {self.configs[name].concurrency})")
 
     async def stop(self):
+        logger.info("Stopping Dispatcher...")
         self._running = False
         for t in self._managers:
             t.cancel()
         await asyncio.gather(*self._managers, return_exceptions=True)
+        logger.info("Dispatcher stopped.")
 
     async def submit(self, ctx: JobContext):
-        # Simply add to the end of the line (Fairness)
+        logger.info(f"[{ctx.job_id}] Submitted to agent '{ctx.agent_name}' with {len(ctx.items)} items")
         self.rotations[ctx.agent_name].append(ctx)
 
     def mark_for_cancel(self, job_id: str):
+        logger.info(f"[{job_id}] Marked for cancellation")
         self.cancel_flags.add(job_id)
 
     async def _agent_manager(self, agent_name: str):
-        """The Scheduler Loop: Matches available Semaphores to Waiting Jobs."""
         sem = self.semaphores[agent_name]
         rotation = self.rotations[agent_name]
+        
+        logger.debug(f"Manager loop started for {agent_name}")
 
         while self._running:
             if not rotation:
-                await asyncio.sleep(0.05) # Prevent CPU spin when idle
+                await asyncio.sleep(0.05)
                 continue
 
-            # 1. Wait for a "Parking Space" (Agent Capacity)
+            # Wait for available slot
             await sem.acquire()
 
-            # 2. Pick the next job fairly
+            # Pick next job (Fairness)
             ctx = rotation.popleft()
-
-            # 3. Spawn a worker for this specific batch
+            
+            # Spawn worker
             asyncio.create_task(self._run_batch_step(ctx, sem, rotation))
 
     async def _run_batch_step(self, ctx: JobContext, sem: asyncio.Semaphore, rotation: deque):
         batch_items = []
-        sem_released = False  # Track explicit release to prevent double-release errors
-
+        sem_released = False
+        
         try:
             async with ctx.lock:
-                # --- A. Check Cancellation ---
+                # 1. Check Cancel
                 if ctx.job_id in self.cancel_flags:
+                    logger.info(f"[{ctx.job_id}] Cancellation detected during batch prep")
                     if not ctx.done_evt.is_set():
                         await ctx.callbacks.on_job_canceled(
                             ctx.job_id, ctx.agent_name, ctx.processed_count, "Canceled by User"
@@ -98,64 +102,60 @@ class Dispatcher:
                     sem.release()
                     return
 
-                # --- B. Mutate State (Pop Items) ---
+                # 2. Pop Batch
                 for _ in range(ctx.batch_size):
                     if not ctx.items: break
                     batch_items.append(ctx.items.popleft())
 
                 if not batch_items:
-                    # Should not happen logic-wise, but safe guard
                     sem.release()
                     return
 
                 ctx.active_batches += 1
-
-                # --- C. Re-queue for Fairness ---
-                # If items remain, put job back in line for the next available worker
+                
+                # 3. Rotate
                 if ctx.items:
                     rotation.append(ctx)
 
-            # --- D. Execute HTTP (The Heavy Lift) ---
+            # 4. Process
+            # We assume batch_index 0 for log clarity since we aren't tracking absolute index in this specific logic
+            # (You could add a 'current_batch_index' to ctx if strict indexing is needed)
+            logger.debug(f"[{ctx.job_id}] Processing batch of size {len(batch_items)}")
+            
             try:
                 res = await self.http_engine.process_batch(
                     ctx.url, 
                     {
                         "job_id": ctx.job_id, 
-                        "agent_name": ctx.agent_name,
+                        "agent_name": ctx.agent_name, 
                         "items": batch_items, 
                         "params": ctx.params
                     }, 
                     ctx.timeout
                 )
             finally:
-                # CRITICAL OPTIMIZATION:
-                # Release the agent capacity *immediately* after HTTP finishes.
-                # Do not wait for S3 callbacks.
                 sem.release()
                 sem_released = True
 
-            # --- E. Callbacks & Finalization ---
+            # 5. Finalize
             async with ctx.lock:
                 ctx.active_batches -= 1
                 ctx.processed_count += len(batch_items)
-
-                # 1. Batch Done Callback
+                
                 await ctx.callbacks.on_batch_done(
                     ctx.job_id, ctx.agent_name, 0, len(batch_items), res
                 )
 
-                # 2. Job Complete Check
-                # Done if: No items left AND no other workers are currently running batches
                 if not ctx.items and ctx.active_batches == 0 and not ctx.done_evt.is_set():
+                    logger.info(f"[{ctx.job_id}] Job Finished. Total Processed: {ctx.processed_count}")
                     await ctx.callbacks.on_job_done(
                         ctx.job_id, ctx.agent_name, ctx.processed_count, "Success"
                     )
                     ctx.done_evt.set()
-                    # Clean up cancel flag to free memory
                     self.cancel_flags.discard(ctx.job_id)
 
         except Exception as e:
-            # Emergency cleanup
+            logger.error(f"[{ctx.job_id}] Unexpected error in batch: {e}", exc_info=True)
             if not sem_released:
                 sem.release()
             
